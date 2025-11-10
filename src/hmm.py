@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
+from torch.distributions import Categorical
+
 
 def stable_mvm(log_W, log_x):
     log_x_max = torch.amax(log_x)
@@ -14,6 +16,7 @@ def stable_mvm(log_W, log_x):
     z_norm = W_norm @ x_norm
 
     return torch.log(z_norm) + log_x_max + torch.squeeze(log_W_max, dim=-1)
+
 
 class HMM(nn.Module, PyTorchModelHubMixin):
     def __init__(self, hidden_size, vocab_size, eos_token_id, sep_token_id=None):
@@ -48,11 +51,14 @@ class HMM(nn.Module, PyTorchModelHubMixin):
         self.eos_token_id = eos_token_id
         self.sep_token_id = sep_token_id
 
-
         # ------------------- Set #1 of weights -------------------------
-        self.register_buffer('weights_tensor', torch.zeros(vocab_size, dtype=torch.float32))  
-        self.register_buffer('exp_weights', torch.ones(vocab_size, dtype=torch.float32))      
-        self.register_buffer('weighted_beta', torch.zeros(hidden_size, vocab_size, dtype=torch.float32))
+        self.register_buffer(
+            "weights_tensor", torch.zeros(vocab_size, dtype=torch.float32)
+        )
+        self.register_buffer("exp_weights", torch.ones(vocab_size, dtype=torch.float32))
+        self.register_buffer(
+            "weighted_beta", torch.zeros(hidden_size, vocab_size, dtype=torch.float32)
+        )
 
         # Initialize set #1 to something by default (optional)
         self.set_weights(weights_tensor=torch.zeros(vocab_size))
@@ -61,12 +67,12 @@ class HMM(nn.Module, PyTorchModelHubMixin):
     def pi(self):
         """Initial state distribution (gamma_exp)"""
         return self.gamma_exp.squeeze(0)  # Convert from (1, H) to (H)
-    
-    @property  
+
+    @property
     def log_B(self):
         """Log emission probabilities (beta)"""
         return self.beta  # Already in log space
-    
+
     @property
     def w(self):
         """Exponentiated weights for toxicity"""
@@ -82,61 +88,69 @@ class HMM(nn.Module, PyTorchModelHubMixin):
             )
 
         # Update weights_tensor and exp_weights
-        self.weights_tensor.copy_(weights_tensor)  
-        self.exp_weights.copy_(torch.exp(weights_tensor))  
+        self.weights_tensor.copy_(weights_tensor)
+        self.exp_weights.copy_(torch.exp(weights_tensor))
 
         # Update weighted_beta: P(x|s) * exp{w(x)}
         P_x_given_s = torch.exp(self.beta)  # (H, V)
         weighted_beta = P_x_given_s * self.exp_weights.unsqueeze(0)  # (H, V)
         self.weighted_beta.copy_(weighted_beta)  # (H, V)
 
-    def forward_step(self, current_z: torch.Tensor, next_tokens: torch.Tensor) -> torch.Tensor:
+    def forward_step(
+        self, current_z: torch.Tensor, next_tokens: torch.Tensor
+    ) -> torch.Tensor:
         """
         Compute one forward step of the HMM given current hidden state distribution and next tokens.
-        
+
         Args:
             current_z: Current hidden state distribution, shape (B, H)
             next_tokens: Next observed tokens, shape (B,)
-        
+
         Returns:
             Updated hidden state distribution, shape (B, H)
         """
         # Transition: P(z_t+1 | z_t) using alpha_exp matrix
         # current_z: (B, H), alpha_exp: (H, H) -> (B, H, H)
-        transition_probs = current_z.unsqueeze(2) * self.alpha_exp.unsqueeze(0)  # (B, H, H)
-        
+        transition_probs = current_z.unsqueeze(2) * self.alpha_exp.unsqueeze(
+            0
+        )  # (B, H, H)
+
         # Sum over previous states to get marginal: P(z_t+1)
         next_z_marginal = transition_probs.sum(dim=1)  # (B, H)
-        
-        # Emission: P(x_t+1 | z_t+1) using beta matrix  
+
+        # Emission: P(x_t+1 | z_t+1) using beta matrix
         # beta: (H, V), next_tokens: (B,) -> (B, H)
         emission_logprobs = self.beta[:, next_tokens].T  # (B, H)
-        emission_probs = torch.exp(emission_logprobs)    # (B, H)
-        
+        emission_probs = torch.exp(emission_logprobs)  # (B, H)
+
         # Apply emission probabilities
         updated_z = next_z_marginal * emission_probs  # (B, H)
-        
+
         # Normalize to ensure it's a valid probability distribution
         updated_z = updated_z / (updated_z.sum(dim=1, keepdim=True) + 1e-12)
-        
+
         return updated_z
 
     def compute_forward_probability(self, input_ids):
         batch_size, m = input_ids.size()
         x = input_ids[:, 0]
-        emission = self.beta[:, x].transpose(0, 1) 
+        emission = self.beta[:, x].transpose(0, 1)
         gamma = torch.log(self.gamma_exp)
         alpha_prev = gamma + emission
 
         for t in range(1, m):
-            alpha_prev = torch.vmap(stable_mvm, in_dims=(None, 0))(torch.log(self.alpha_exp + 1e-12).T, alpha_prev)
+            alpha_prev = torch.vmap(stable_mvm, in_dims=(None, 0))(
+                torch.log(self.alpha_exp + 1e-12).T, alpha_prev
+            )
             x_t = input_ids[:, t]
             emission = self.beta[:, x_t].transpose(0, 1)
             alpha_prev = alpha_prev + emission
 
         return alpha_prev
 
-    def compute_backward_expectation_for_weights(self, T: int, weighted_beta: torch.Tensor) -> torch.Tensor:
+    def compute_backward_expectation_for_weights(
+        self, T: int, weighted_beta: torch.Tensor
+    ) -> torch.Tensor:
         """
         Reusable routine to compute B(t, s) for any given weighted_beta.
         B[t, s] = E[exp{ sum_{i=t+1}^T w(x_i) }] for z_t = s.
@@ -163,3 +177,85 @@ class HMM(nn.Module, PyTorchModelHubMixin):
         """
         return self.compute_backward_expectation_for_weights(T, self.weighted_beta)
 
+    @torch.no_grad()
+    def sample(
+        self,
+        max_len: int,
+        batch_size: int = 1,
+        start_states: torch.Tensor | None = None,
+        temperature: float = 1.0,
+        pad_token_id: int | None = None,
+        stop_on_eos: bool = True,
+    ):
+        """
+        Returns:
+          tokens:  (B, L) LongTensor of sampled tokens (padded if early stop)
+          states:  (B, L) LongTensor of sampled hidden states
+          lengths: (B,)   LongTensor of generated lengths (<= L)
+        """
+        device = self.alpha_exp.device
+        H, V = self.hidden_size, self.vocab_size
+
+        # Parameters
+        A = self.alpha_exp  # (H, H) (row-stochastic)
+        logB = self.log_B  # (H, V) (log-probs)
+        pi = self.pi  # (H,)   (probs)
+
+        # Init state per sequence
+        if start_states is None:
+            s = Categorical(probs=pi).sample((batch_size,)).to(device)  # (B,)
+        else:
+            s = start_states.to(device).clone()  # (B,)
+
+        # Buffers
+        L = max_len
+        tokens = torch.full(
+            (batch_size, L),
+            -1 if pad_token_id is None else pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        states = torch.empty((batch_size, L), dtype=torch.long, device=device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        # Helper: EOS/SEP predicate
+        def is_stop(tok):
+            if not stop_on_eos:
+                return torch.zeros_like(tok, dtype=torch.bool, device=device)
+            if self.sep_token_id is not None:
+                return tok == self.sep_token_id
+            return tok == self.eos_token_id
+
+        # Time loop
+        for t in range(L):
+            states[:, t] = s
+
+            # Emission logits for current states
+            logits_x = logB[s, :]  # (B, V)
+            if temperature != 1.0:
+                logits_x = logits_x / temperature
+
+            x = Categorical(logits=logits_x).sample()  # (B,)
+            # Keep previous token if finished; otherwise write x
+            write_mask = ~finished
+            tokens[write_mask, t] = x[write_mask]
+
+            # Mark newly finished
+            newly_finished = is_stop(x) & (~finished)
+            finished = finished | newly_finished
+            lengths[newly_finished] = t + 1
+
+            # Early exit if all sequences finished
+            if torch.all(finished):
+                break
+
+            # Transition to next state for unfinished sequences
+            trans_probs = A[s, :]  # (B, H)
+            s_next = Categorical(probs=trans_probs).sample()
+            s = torch.where(finished, s, s_next)
+
+        # Any sequences that never hit EOS/SEP use full length
+        lengths[~finished] = L
+
+        return tokens, states, lengths
